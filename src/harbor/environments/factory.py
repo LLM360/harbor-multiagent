@@ -41,6 +41,11 @@ _ENVIRONMENT_REGISTRY: dict[EnvironmentType, _EnvEntry] = {
         "DockerEnvironment",
         None,
     ),
+    EnvironmentType.HELM: _EnvEntry(
+        "harbor.environments.helm.helm",
+        "HelmEnvironment",
+        None,
+    ),
     EnvironmentType.SBX: _EnvEntry(
         "harbor.environments.sbx", "DockerSandboxesEnvironment", "sbx"
     ),
@@ -258,7 +263,9 @@ class EnvironmentFactory:
             trial_paths=trial_paths,
             task_env_config=task_env_config,
             logger=logger,
-            **kwargs,
+            # Task-declared [environment.kwargs] are the base; config/CLI kwargs
+            # override them. Honors task.toml backend kwargs (chart_path, ...).
+            **{**task_env_config.kwargs, **kwargs},
         )
 
     @classmethod
@@ -356,7 +363,9 @@ class EnvironmentFactory:
             trial_paths=trial_paths,
             task_env_config=task_env_config,
             logger=logger,
-            **kwargs,
+            # Task-declared [environment.kwargs] are the base; config/CLI kwargs
+            # override them. Honors task.toml backend kwargs (chart_path, ...).
+            **{**task_env_config.kwargs, **kwargs},
         )
 
     @classmethod

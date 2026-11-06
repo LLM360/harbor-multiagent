@@ -3,6 +3,7 @@ from enum import Enum
 
 class EnvironmentType(str, Enum):
     DOCKER = "docker"
+    HELM = "helm"
     SBX = "sbx"
     PODMAN = "podman"
     DAYTONA = "daytona"

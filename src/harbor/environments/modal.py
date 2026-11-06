@@ -38,6 +38,11 @@ from harbor.environments.definition import (
     should_use_prebuilt_docker_image,
 )
 from harbor.environments.dind_compose import DinDComposeOps
+from harbor.environments.kube_ops import (
+    KubeOnSandboxOps,
+    configure_kube_ops,
+    kube_chart_present,
+)
 from harbor.environments.docker import (
     COMPOSE_BUILD_PATH,
     COMPOSE_NO_NETWORK_PATH,
@@ -372,6 +377,124 @@ class _ModalDirect(_ModalStrategy):
                 env._sandbox.object_id,
             ],
         )
+
+
+class _ModalKube(KubeOnSandboxOps, _ModalStrategy):
+    """Kubernetes-in-sandbox strategy: a single-node k3s cluster runs *inside*
+    a Modal VM sandbox and the agent's foothold is a pod.
+
+    Mirrors ``_DaytonaKube``. Cluster lifecycle and helm/kubectl come from
+    :class:`KubeOnSandboxOps`; the five host primitives reuse the Modal SDK
+    calls the DinD strategy uses. Selected when the task ships a Helm chart.
+
+    k3s needs a real kernel (overlayfs + netfilter), which gVisor lacks, so this
+    strategy always creates the sandbox with ``vm_runtime``.
+
+    Topology:
+        Local machine (harbor CLI)
+          └── Modal Sandbox (vm_runtime)
+                └── k3s single-node cluster
+                      └── main pod  ← agent runs here; exec/cp target this
+    """
+
+    _DEFAULT_KUBE_IMAGE = "alpine/k8s:1.30.2"  # ships helm + kubectl + curl
+
+    def __init__(self, env: "ModalEnvironment"):
+        super().__init__(env)
+        configure_kube_ops(
+            self,
+            environment_name=env.environment_name,
+            session_id=env.session_id,
+            kwargs=env._kwargs,
+        )
+
+    # ── KubeOnSandboxOps primitives (same transport as _ModalDinD) ──
+    @override
+    async def _host_exec(
+        self, command: str, timeout_sec: int | None = None
+    ) -> ExecResult:
+        return await self._env._sdk_exec(command, timeout_sec=timeout_sec, shell="sh")
+
+    @override
+    async def _stage_file_to_host(self, source_path: Path | str, host_path: str):
+        await self._env._sdk_upload_file(source_path, host_path)
+
+    @override
+    async def _stage_dir_to_host(self, source_dir: Path | str, host_dir: str):
+        await self._env._sdk_upload_dir(source_dir, host_dir)
+
+    @override
+    async def _fetch_file_from_host(self, host_path: str, target_path: Path | str):
+        await self._env._sdk_download_file(host_path, target_path)
+
+    @override
+    async def _fetch_dir_from_host(self, host_dir: str, target_dir: Path | str):
+        await self._env._sdk_download_dir(host_dir, target_dir)
+
+    @override
+    async def start(self, force_build: bool) -> None:
+        env = self._env
+
+        launcher_name = self._launcher.name
+        if launcher_name != "k3s":
+            # kind/k3d need an inner Docker daemon; only k3s (embedded
+            # containerd) has been validated on Modal vm_runtime.
+            raise RuntimeError(
+                f"Modal kube mode supports launcher='k3s' only, got {launcher_name!r}."
+            )
+
+        kube_image: str = env._kwargs.get("kube_image", self._DEFAULT_KUBE_IMAGE)
+        env._image = Image.from_registry(kube_image)
+        env._app = await App.lookup.aio(
+            name=env._app_name,
+            create_if_missing=True,
+        )
+        # Kube sandbox needs network for cluster setup and image pulls; the
+        # keepalive entrypoint holds the VM up while k3s runs detached.
+        env._sandbox = await env._create_sandbox(
+            entrypoint=["sh", "-c", "sleep infinity"],
+            block_network=False,
+            experimental_options={"vm_runtime": True},
+        )
+
+        self._main_pod = await self._kube_start()
+        env.default_user = None
+        await env.ensure_dirs(env._mount_targets(writable_only=True))
+
+    @override
+    async def stop(self, delete: bool) -> None:
+        env = self._env
+        # Tear down the helm release/cluster before terminating the sandbox.
+        if env._sandbox:
+            try:
+                await self._kube_stop(delete=True)
+            except Exception as e:
+                env.logger.warning(f"kube teardown failed: {e}")
+        await self._teardown_sandbox()
+
+    # exec/upload/download come from KubeOnSandboxOps (first in the MRO) and
+    # target the foothold pod; is_dir/is_file must too, not the VM filesystem.
+    @override
+    async def is_dir(self, path: str, user: str | int | None = None) -> bool:
+        result = await self.exec(f"test -d {shlex.quote(path)}", user=user)
+        return result.return_code == 0
+
+    @override
+    async def is_file(self, path: str, user: str | int | None = None) -> bool:
+        result = await self.exec(f"test -f {shlex.quote(path)}", user=user)
+        return result.return_code == 0
+
+    @override
+    async def attach(self) -> None:
+        env = self._env
+        if not env._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        if not self._main_pod:
+            raise RuntimeError(
+                "No foothold pod resolved; the kube environment did not start "
+                "successfully. Cannot attach."
+            )
+        os.execvp("modal", ["modal", "shell", env._sandbox.object_id])
 
 
 class _ModalDinD(DinDComposeOps, _ModalStrategy):
@@ -917,6 +1040,8 @@ class ModalEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     def _validate_definition(self):
         if self.task_env_config.docker_image:
             return
+        if self._kube_mode:
+            return
         if self._compose_mode:
             path = self.environment_dir / "docker-compose.yaml"
             if not path.exists() and not self.extra_docker_compose_paths:
@@ -993,12 +1118,19 @@ class ModalEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             phase_network_policies=resolved_phase_network_policies,
         )
 
-        # Detect compose mode *before* super().__init__ which calls
-        # _validate_definition
-        self._compose_mode = (environment_dir / "docker-compose.yaml").exists() or bool(
-            extra_docker_compose
+        # Detect kube/compose mode *before* super().__init__ which calls
+        # _validate_definition. Precedence: kube (chart) > compose > direct.
+        self._kube_mode = kube_chart_present(environment_dir, kwargs)
+        if self._kube_mode:
+            # k3s needs a real kernel; gVisor can't keep the control plane up.
+            self._vm_runtime_enabled = True
+        self._compose_mode = not self._kube_mode and (
+            (environment_dir / "docker-compose.yaml").exists()
+            or bool(extra_docker_compose)
         )
-        self._dynamic_network = self._dynamic_network and not self._compose_mode
+        self._dynamic_network = (
+            self._dynamic_network and not self._compose_mode and not self._kube_mode
+        )
         # DinD mode requires host networking — cannot enforce network isolation.
         self._capabilities = EnvironmentCapabilities(
             stream=not self._compose_mode,
@@ -1015,6 +1147,19 @@ class ModalEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             dynamic_network_policy=self._dynamic_network,
             docker_compose=True,
         )
+        if self._kube_mode:
+            # Kube-in-sandbox: the agent runs in a pod with no GPU passthrough,
+            # no sandbox-level egress enforcement (the chart owns NetworkPolicy),
+            # not host-mounted, no compose orchestration. Matches _DaytonaKube.
+            self._capabilities = EnvironmentCapabilities(
+                stream=False,
+                gpus=False,
+                disable_internet=False,
+                network_allowlist=False,
+                dynamic_network_policy=False,
+                mounted=False,
+                docker_compose=False,
+            )
         self._kwargs = kwargs
         if not _HAS_MODAL:
             raise MissingExtraError(package="modal", extra="modal")
@@ -1041,7 +1186,7 @@ class ModalEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         # so the service-level setting continues to apply there.
         self._workdir = (
             None
-            if self._compose_mode
+            if self._compose_mode or self._kube_mode
             else parse_dockerfile_workdir(self._environment_definition_path)
         )
         self._image: Image | None = None
@@ -1058,7 +1203,11 @@ class ModalEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         # Select strategy based on compose mode
         self._strategy: _ModalStrategy = (
-            _ModalDinD(self) if self._compose_mode else _ModalDirect(self)
+            _ModalKube(self)
+            if self._kube_mode
+            else _ModalDinD(self)
+            if self._compose_mode
+            else _ModalDirect(self)
         )
         self.logger.debug(f"Selected strategy: {self._strategy.__class__.__name__}")
         if self._vm_runtime_enabled:
@@ -1080,7 +1229,7 @@ class ModalEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         Alpine-based DinD images only have ``sh``; standard images have ``bash``.
         """
-        return "sh" if self._compose_mode else "bash"
+        return "sh" if self._compose_mode or self._kube_mode else "bash"
 
     def _cpu_config(
         self,

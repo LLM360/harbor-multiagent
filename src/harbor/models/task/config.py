@@ -439,6 +439,12 @@ class EnvironmentConfig(BaselineNetworkPolicyConfig):
         description="A pre-built Docker image to use for the environment. When set, "
         "environment/Dockerfile is optional for supported environment types.",
     )
+    kwargs: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Backend-specific constructor kwargs forwarded to the "
+        "environment class (e.g. the Helm backend's launcher/chart_path/"
+        "values). Merged under any job/CLI --environment-kwarg overrides.",
+    )
     os: TaskOS = Field(
         default=TaskOS.LINUX,
         description="Target operating system for the task's container. "
