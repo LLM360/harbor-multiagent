@@ -475,6 +475,11 @@ def configure_kube_ops(
     ops._cluster_create_timeout_sec = int(kwargs.get("cluster_create_timeout_sec", 420))
     ops._ready_timeout_sec = int(kwargs.get("ready_timeout_sec", 180))
     ops._main_container = kwargs.get("main_container")
+    # Seat (multi-agent) config: map each seat name to a pod selector and
+    # optional container. Empty by default (single-agent tasks use none).
+    ops._seat_selectors = kwargs.get("seat_selectors") or {}
+    ops._seat_containers = kwargs.get("seat_containers") or {}
+    ops._seat_pods = {}
     launcher_name = kwargs.get("launcher", default_launcher)
     cluster_name = _sanitize_k8s_name(kwargs.get("cluster_name") or f"hb-{session_id}")
     ops._release_name = _sanitize_k8s_name(
@@ -927,12 +932,45 @@ class KubeOnSandboxOps:
         pod = self._main_pod
         if pod is None:
             raise RuntimeError("kube exec called before start() resolved a pod.")
+        return await self._exec_on_pod(
+            pod,
+            self._main_container,
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            user=user,
+            apply_env_defaults=True,
+        )
 
-        user = self._env._resolve_user(user)
-        env = self._env._merge_env(env)
+    async def _exec_on_pod(
+        self,
+        pod: str,
+        container: str | None,
+        command: str,
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_sec: int | None,
+        user: str | int | None,
+        apply_env_defaults: bool,
+    ) -> ExecResult:
+        """Run ``command`` in one pod via ``kubectl exec``.
+
+        ``apply_env_defaults`` mirrors the Docker backend's main container: it
+        resolves the environment's default user, merges its persistent env, and
+        falls back to the task workdir. Seat (non-main) execs pass False so they
+        inherit none of the main container's identity — only what the caller
+        passes — matching the compose sidecar-exec semantics.
+        """
+        if apply_env_defaults:
+            user = self._env._resolve_user(user)
+            env = self._env._merge_env(env)
+            effective_cwd = cwd or self._env.task_env_config.workdir
+        else:
+            effective_cwd = cwd
 
         # kubectl exec has no -w/-e/-u; inject cwd/env/user into the in-pod shell.
-        effective_cwd = cwd or self._env.task_env_config.workdir
         script = (
             f"cd {shlex.quote(effective_cwd)} && {command}"
             if effective_cwd
@@ -946,13 +984,15 @@ class KubeOnSandboxOps:
             inner = ["runuser", "-u", str(user), "--", *inner]
 
         argv = [*self._kubectl_base(), "exec", pod]
-        if self._main_container:
-            argv.extend(["-c", self._main_container])
+        if container:
+            argv.extend(["-c", container])
         argv.extend(["--", *inner])
 
         return await self._run_host(argv, check=False, timeout_sec=timeout_sec)
 
-    def _cp_argv(self, source: str, target: str) -> list[str]:
+    def _cp_argv(
+        self, source: str, target: str, container: str | None = None
+    ) -> list[str]:
         argv = [
             "kubectl",
             "--context",
@@ -961,59 +1001,85 @@ class KubeOnSandboxOps:
             source,
             target,
         ]
-        if self._main_container:
-            argv.extend(["-c", self._main_container])
+        if container is None:
+            container = self._main_container
+        if container:
+            argv.extend(["-c", container])
         return argv
 
-    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+    async def _upload_file_to_pod(
+        self, pod: str, container: str | None, source_path: Path | str, target_path: str
+    ) -> None:
         """Two-hop: stage to host temp, then ``kubectl cp`` host → pod."""
-        pod = self._require_pod()
         temp = f"/tmp/harbor_{uuid4().hex}"
         try:
             await self._stage_file_to_host(source_path, temp)
             await self._run_host(
-                self._cp_argv(temp, self._remote_path(pod, target_path)),
+                self._cp_argv(temp, self._remote_path(pod, target_path), container),
                 timeout_sec=self._CP_FILE_TIMEOUT_SEC,
             )
         finally:
             await self._host_exec(f"rm -f {shlex.quote(temp)}", timeout_sec=10)
 
-    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        pod = self._require_pod()
+    async def _upload_dir_to_pod(
+        self, pod: str, container: str | None, source_dir: Path | str, target_dir: str
+    ) -> None:
         temp = f"/tmp/harbor_{uuid4().hex}"
         try:
             await self._stage_dir_to_host(source_dir, temp)
             await self._run_host(
-                self._cp_argv(temp, self._remote_path(pod, target_dir)),
+                self._cp_argv(temp, self._remote_path(pod, target_dir), container),
                 timeout_sec=self._CP_DIR_TIMEOUT_SEC,
             )
         finally:
             await self._host_exec(f"rm -rf {shlex.quote(temp)}", timeout_sec=10)
 
-    async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        pod = self._require_pod()
+    async def _download_file_from_pod(
+        self, pod: str, container: str | None, source_path: str, target_path: Path | str
+    ) -> None:
         temp = f"/tmp/harbor_{uuid4().hex}"
         try:
             await self._run_host(
-                self._cp_argv(self._remote_path(pod, source_path), temp),
+                self._cp_argv(self._remote_path(pod, source_path), temp, container),
                 timeout_sec=self._CP_FILE_TIMEOUT_SEC,
             )
             await self._fetch_file_from_host(temp, target_path)
         finally:
             await self._host_exec(f"rm -f {shlex.quote(temp)}", timeout_sec=10)
 
-    async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        pod = self._require_pod()
+    async def _download_dir_from_pod(
+        self, pod: str, container: str | None, source_dir: str, target_dir: Path | str
+    ) -> None:
         temp = f"/tmp/harbor_{uuid4().hex}"
         try:
             await self._host_exec(f"mkdir -p {shlex.quote(temp)}", timeout_sec=10)
             await self._run_host(
-                self._cp_argv(self._remote_path(pod, source_dir), temp),
+                self._cp_argv(self._remote_path(pod, source_dir), temp, container),
                 timeout_sec=self._CP_DIR_TIMEOUT_SEC,
             )
             await self._fetch_dir_from_host(temp, target_dir)
         finally:
             await self._host_exec(f"rm -rf {shlex.quote(temp)}", timeout_sec=10)
+
+    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+        await self._upload_file_to_pod(
+            self._require_pod(), self._main_container, source_path, target_path
+        )
+
+    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+        await self._upload_dir_to_pod(
+            self._require_pod(), self._main_container, source_dir, target_dir
+        )
+
+    async def download_file(self, source_path: str, target_path: Path | str) -> None:
+        await self._download_file_from_pod(
+            self._require_pod(), self._main_container, source_path, target_path
+        )
+
+    async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+        await self._download_dir_from_pod(
+            self._require_pod(), self._main_container, source_dir, target_dir
+        )
 
     def _require_pod(self) -> str:
         pod = self._main_pod
@@ -1022,3 +1088,109 @@ class KubeOnSandboxOps:
                 "kube file transfer called before start() resolved a pod."
             )
         return pod
+
+    # ── Seat (per-pod) operations ────────────────────────────────────────
+    # A multi-agent (seats) task runs one agent per k8s pod. Each seat is a
+    # service name from task.toml [agents.<seat>]; it maps to a pod by label
+    # selector so SeatEnvironment's per-service exec/upload/download reach it.
+    _seat_selectors: dict[str, str] = {}
+    _seat_containers: dict[str, str] = {}
+
+    async def _resolve_seat_pod(self, service: str) -> str:
+        """Resolve the single pod backing a seat, by label selector.
+
+        The selector is an explicit ``[environment.kwargs].seat_selectors.<svc>``
+        if given, else ``app.kubernetes.io/component=<svc>``. Cached per seat.
+        """
+        cache = getattr(self, "_seat_pods", None)
+        if cache is None:
+            cache = {}
+            self._seat_pods = cache
+        if service in cache:
+            return cache[service]
+        selector = getattr(self, "_seat_selectors", {}).get(
+            service, f"app.kubernetes.io/component={service}"
+        )
+        result = await self._run_host(
+            [
+                *self._kubectl_base(),
+                "get",
+                "pod",
+                "-l",
+                selector,
+                "-o",
+                "jsonpath={.items[*].metadata.name}",
+            ],
+            timeout_sec=30,
+        )
+        pods = sorted((result.stdout or "").split())
+        if not pods:
+            raise RuntimeError(
+                f"No pod matched selector {selector!r} for seat {service!r} in "
+                f"namespace {self._namespace!r}."
+            )
+        if len(pods) > 1:
+            raise RuntimeError(
+                f"Seat selector {selector!r} for {service!r} matched {len(pods)} "
+                f"pods ({', '.join(pods)}); a seat must resolve to exactly one "
+                "pod. Set [environment.kwargs].seat_selectors.<seat>."
+            )
+        cache[service] = pods[0]
+        return pods[0]
+
+    def _seat_container(self, service: str) -> str | None:
+        return getattr(self, "_seat_containers", {}).get(service)
+
+    async def service_exec(
+        self,
+        command: str,
+        *,
+        service: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        pod = await self._resolve_seat_pod(service)
+        return await self._exec_on_pod(
+            pod,
+            self._seat_container(service),
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            user=user,
+            apply_env_defaults=False,
+        )
+
+    async def service_upload_file(
+        self, source_path: Path | str, target_path: str, *, service: str
+    ) -> None:
+        pod = await self._resolve_seat_pod(service)
+        await self._upload_file_to_pod(
+            pod, self._seat_container(service), source_path, target_path
+        )
+
+    async def service_upload_dir(
+        self, source_dir: Path | str, target_dir: str, *, service: str
+    ) -> None:
+        pod = await self._resolve_seat_pod(service)
+        await self._upload_dir_to_pod(
+            pod, self._seat_container(service), source_dir, target_dir
+        )
+
+    async def service_download_file(
+        self, source_path: str, target_path: Path | str, *, service: str
+    ) -> None:
+        pod = await self._resolve_seat_pod(service)
+        await self._download_file_from_pod(
+            pod, self._seat_container(service), source_path, target_path
+        )
+
+    async def service_download_dir(
+        self, source_dir: str, target_dir: Path | str, *, service: str
+    ) -> None:
+        pod = await self._resolve_seat_pod(service)
+        await self._download_dir_from_pod(
+            pod, self._seat_container(service), source_dir, target_dir
+        )

@@ -391,3 +391,87 @@ class TestStop:
         host = _FakeKubeHost()
         await host._kube_stop(delete=False)
         assert not any("kind delete cluster" in c for c in host._commands())
+
+
+# --------------------------------------------------------------------------- #
+# Seat (per-pod / multi-agent) operations
+# --------------------------------------------------------------------------- #
+class TestSeatOps:
+    async def test_service_exec_resolves_pod_by_default_selector(self):
+        host = _FakeKubeHost()
+        await host.service_exec("ls", service="attacker")
+        cmds = host._commands()
+        # A seat is resolved by label selector app.kubernetes.io/component=<seat>.
+        assert any(
+            "get pod -l app.kubernetes.io/component=attacker" in c for c in cmds
+        )
+        # The exec targets the resolved pod (mock returns 'pod0').
+        assert any(c.endswith("exec pod0 -- bash -c ls") for c in cmds)
+
+    async def test_service_exec_custom_selector(self):
+        host = _FakeKubeHost()
+        host._seat_selectors = {"attacker": "role=atk"}
+        await host.service_exec("ls", service="attacker")
+        assert any("get pod -l role=atk" in c for c in host._commands())
+
+    async def test_service_exec_with_seat_container(self):
+        host = _FakeKubeHost()
+        host._seat_containers = {"attacker": "atk"}
+        await host.service_exec("ls", service="attacker")
+        assert any("exec pod0 -c atk --" in c for c in host._commands())
+
+    async def test_service_exec_does_not_inherit_main_identity(self):
+        # Even if the env would resolve a default user / persistent env for the
+        # main container, a seat exec must not inherit them.
+        host = _FakeKubeHost()
+        host._env._resolve_user = lambda u: "agent"
+        host._env._merge_env = lambda e: {"SECRET": "x"}
+        await host.service_exec("ls", service="attacker")
+        exec_cmd = next(c for c in host._commands() if "exec pod0" in c)
+        assert "runuser" not in exec_cmd
+        assert "SECRET=x" not in exec_cmd
+
+    async def test_main_exec_still_injects_identity(self):
+        # Regression guard: the main path keeps env-default behavior.
+        host = _FakeKubeHost()
+        host._main_pod = "pod0"
+        host._env._resolve_user = lambda u: "agent"
+        host._env._merge_env = lambda e: {"SECRET": "x"}
+        await host.exec("ls")
+        exec_cmd = next(c for c in host._commands() if "exec pod0" in c)
+        assert "runuser -u agent" in exec_cmd
+        assert "env SECRET=x" in exec_cmd
+
+    async def test_service_upload_file_targets_seat_pod(self):
+        host = _FakeKubeHost()
+        await host.service_upload_file("/local/f", "/remote/f", service="attacker")
+        cp_cmd = next(c for c in host._commands() if " cp " in c)
+        assert "cp" in cp_cmd and "default/pod0:/remote/f" in cp_cmd
+
+    async def test_service_download_file_from_seat_pod(self):
+        host = _FakeKubeHost()
+        await host.service_download_file("/remote/f", "/out/f", service="attacker")
+        cp_cmd = next(c for c in host._commands() if " cp " in c)
+        assert "cp default/pod0:/remote/f" in cp_cmd
+        host._fetch_file_from_host.assert_awaited_once()
+
+    async def test_seat_pod_resolution_cached(self):
+        host = _FakeKubeHost()
+        await host.service_exec("ls", service="attacker")
+        await host.service_exec("pwd", service="attacker")
+        gets = [c for c in host._commands() if "get pod -l" in c]
+        assert len(gets) == 1  # resolved once, then cached
+
+    async def test_seat_pod_empty_raises(self):
+        host = _FakeKubeHost()
+        host._host_exec = AsyncMock(return_value=ExecResult(stdout="", return_code=0))
+        with pytest.raises(RuntimeError, match="No pod matched selector"):
+            await host.service_exec("ls", service="attacker")
+
+    async def test_seat_pod_ambiguous_raises(self):
+        host = _FakeKubeHost()
+        host._host_exec = AsyncMock(
+            return_value=ExecResult(stdout="podA podB", return_code=0)
+        )
+        with pytest.raises(RuntimeError, match="must resolve to exactly one"):
+            await host.service_exec("ls", service="attacker")

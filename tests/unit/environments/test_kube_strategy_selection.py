@@ -222,3 +222,63 @@ class TestHelmFailureDiagnostics:
         assert "context deadline exceeded" in message
         assert "minio-0 minio=ImagePullBackOff" in message
         assert "db-0" not in message.split("--- waiting ---")[1]
+
+
+class TestModalSeatRouting:
+    """In kube mode, per-service (seat) ops dispatch to the kube strategy;
+    the main service and compose mode keep the inherited behavior."""
+
+    def _kube_env(self, tmp_path):
+        pytest.importorskip("modal")
+        from harbor.environments.modal import ModalEnvironment
+
+        return ModalEnvironment(
+            environment_dir=_chart_dir(tmp_path),
+            environment_name="hello-helm",
+            session_id="hello-helm__abc",
+            trial_paths=_trial_paths(tmp_path),
+            task_env_config=EnvironmentConfig(cpus=2, memory_mb=2048),
+            launcher="k3s",
+        )
+
+    def test_seat_exec_dispatches_to_strategy(self, tmp_path, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        env = self._kube_env(tmp_path)
+        assert env._is_kube_seat("attacker") is True
+        assert env._is_kube_seat("main") is False
+        assert env._is_kube_seat(None) is False
+
+        strat_exec = AsyncMock(return_value="seat-result")
+        monkeypatch.setattr(env._strategy, "service_exec", strat_exec)
+
+        out = asyncio.run(env.service_exec("ls", service="attacker"))
+        assert out == "seat-result"
+        strat_exec.assert_awaited_once()
+        assert strat_exec.await_args.kwargs["service"] == "attacker"
+
+    def test_main_service_does_not_dispatch_to_seat_ops(self, tmp_path, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        env = self._kube_env(tmp_path)
+        # Main routes through self.exec -> strategy.exec, never service_exec.
+        monkeypatch.setattr(env, "exec", AsyncMock(return_value="main-result"))
+        seat_exec = AsyncMock()
+        monkeypatch.setattr(env._strategy, "service_exec", seat_exec)
+
+        out = asyncio.run(env.service_exec("ls", service="main"))
+        assert out == "main-result"
+        seat_exec.assert_not_awaited()
+
+    def test_seat_upload_dispatches_to_strategy(self, tmp_path, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        env = self._kube_env(tmp_path)
+        up = AsyncMock()
+        monkeypatch.setattr(env._strategy, "service_upload_dir", up)
+        asyncio.run(env.service_upload_dir("/src", "/dst", service="attacker"))
+        up.assert_awaited_once()
+        assert up.await_args.kwargs["service"] == "attacker"

@@ -1723,6 +1723,89 @@ class ModalEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             user=user,
         )
 
+    # ── Seat routing (multi-agent tasks) ─────────────────────────────────
+    # In kube mode a non-main seat is a separate pod; dispatch per-service ops
+    # to the kube strategy. Compose mode keeps the inherited mixin behavior.
+    def _is_kube_seat(self, service: str | None) -> bool:
+        return (
+            self._kube_mode
+            and service is not None
+            and not self.is_main_service(service)
+        )
+
+    @override
+    async def service_exec(
+        self,
+        command: str,
+        *,
+        service: str | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        if self._is_kube_seat(service):
+            return await self._strategy.service_exec(
+                command,
+                service=service,
+                cwd=cwd,
+                env=env,
+                timeout_sec=timeout_sec,
+                user=user,
+            )
+        return await super().service_exec(
+            command,
+            service=service,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+    @override
+    async def service_upload_file(
+        self, source_path: Path | str, target_path: str, *, service: str | None = None
+    ) -> None:
+        if self._is_kube_seat(service):
+            await self._strategy.service_upload_file(
+                source_path, target_path, service=service
+            )
+            return
+        await super().service_upload_file(source_path, target_path, service=service)
+
+    @override
+    async def service_upload_dir(
+        self, source_dir: Path | str, target_dir: str, *, service: str | None = None
+    ) -> None:
+        if self._is_kube_seat(service):
+            await self._strategy.service_upload_dir(
+                source_dir, target_dir, service=service
+            )
+            return
+        await super().service_upload_dir(source_dir, target_dir, service=service)
+
+    @override
+    async def service_download_file(
+        self, source_path: str, target_path: Path | str, *, service: str | None = None
+    ) -> None:
+        if self._is_kube_seat(service):
+            await self._strategy.service_download_file(
+                source_path, target_path, service=service
+            )
+            return
+        await super().service_download_file(source_path, target_path, service=service)
+
+    @override
+    async def service_download_dir(
+        self, source_dir: str, target_dir: Path | str, *, service: str | None = None
+    ) -> None:
+        if self._is_kube_seat(service):
+            await self._strategy.service_download_dir(
+                source_dir, target_dir, service=service
+            )
+            return
+        await super().service_download_dir(source_dir, target_dir, service=service)
+
     @override
     async def upload_file(self, source_path: Path | str, target_path: str):
         return await self._strategy.upload_file(source_path, target_path)
