@@ -862,6 +862,16 @@ class SeatConfig(BaseModel):
             "under test has ended; the others never hold it open."
         ),
     )
+    user: str | int | None = Field(
+        default=None,
+        description=(
+            "The OS user this seat's agent runs as. For Compose seats the "
+            "service's user: applies and this stays null. Environments with no "
+            "per-service user (e.g. a Kubernetes pod shared via the main "
+            "transport) use it as the seat's default_user so the agent runs "
+            "unprivileged via runuser, matching the single-agent [agent].user."
+        ),
+    )
     mcp_servers: list[MCPServerConfig] = Field(
         default_factory=list,
         description="Added to [environment] mcp_servers for this seat's agent.",

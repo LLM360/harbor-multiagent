@@ -242,11 +242,26 @@ class SeatsTrial(SingleStepTrial):
         ownership fixes target that uid, create /logs/agent, then run the
         agent's own setup."""
         environment = seat.environment
-        ids = await environment.exec("id -u")
-        uid = (ids.stdout or "").strip()
-        if ids.return_code != 0 or not uid.isdecimal():
-            raise RuntimeError(f"Seat {seat.name!r}: could not resolve its user: {uid}")
-        environment.default_user = int(uid)
+        # A seat may declare its OS user (task.toml [agents.<seat>].user). Use
+        # it when set; otherwise discover the service/pod uid with `id -u` (the
+        # Compose path, where the service's user: already applies).
+        seat_user = self.task.config.agents[seat.name].user
+        if seat_user is not None:
+            environment.default_user = seat_user
+        else:
+            ids = await environment.exec("id -u")
+            uid = (ids.stdout or "").strip()
+            if ids.return_code != 0 or not uid.isdecimal():
+                raise RuntimeError(
+                    f"Seat {seat.name!r}: could not resolve its user: {uid}"
+                )
+            environment.default_user = int(uid)
+        # The main seat shares the trial's project transport (its exec/upload go
+        # through the project, not a per-seat pod), so the project must carry the
+        # seat's user for the agent to run as it. Non-main seats run in their own
+        # pod/service and apply their user there.
+        if environment.is_main_service(seat.name) and seat_user is not None:
+            environment.project.default_user = seat_user
         logs_dir = self.agent_env_paths.agent_dir
         made = await environment.ensure_dirs([logs_dir])
         if made is not None and made.return_code != 0:
