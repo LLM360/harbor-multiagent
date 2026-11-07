@@ -32,9 +32,14 @@ from harbor.utils.templating import render_prompt_template
 
 
 class NonZeroAgentExitCodeError(RuntimeError):
-    """Raised when the agent process exits with a non-zero exit code."""
+    """Raised when the agent process exits with a non-zero exit code.
 
-    pass
+    ``return_code`` is the process exit code when known (set by ``_exec``), so
+    callers can tell an expected termination (e.g. SIGTERM, 143, when a sidecar
+    freezes the agent or the orchestrator cancels it) from a real failure.
+    """
+
+    return_code: int | None = None
 
 
 class ApiError(NonZeroAgentExitCodeError):
@@ -1045,7 +1050,9 @@ class BaseInstalledAgent(BaseAgent, ABC):
                     "stderr": self._truncate_output(result.stderr),
                 },
             )
-            raise self._classify_exec_error(command, result)
+            err = self._classify_exec_error(command, result)
+            err.return_code = result.return_code
+            raise err
 
         self.logger.debug(
             "Command outputs captured",

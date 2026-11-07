@@ -348,7 +348,16 @@ class SeatsTrial(SingleStepTrial):
                         context=context,
                     )
         except NonZeroAgentExitCodeError as exc:
-            seat.result.exception_info = ExceptionInfo.from_exception(exc)
+            # A SIGTERM (143) is an expected episode-boundary termination, not an
+            # agent failure: a task sidecar freezes the agent when it declares,
+            # and the orchestrator cancels the other seats when play ends. Record
+            # other non-zero exits (as a single-agent trial does) but not this.
+            if getattr(exc, "return_code", None) in (143, -15):
+                seat.logger.info(
+                    "Seat %r terminated by SIGTERM (expected episode end)", seat.name
+                )
+            else:
+                seat.result.exception_info = ExceptionInfo.from_exception(exc)
         except Exception as exc:
             seat.result.exception_info = ExceptionInfo.from_exception(exc)
             raise

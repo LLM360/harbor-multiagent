@@ -79,7 +79,6 @@ def test_seats_survive_toml_round_trip():
     [
         ("[agents.maya]\nunder_test = false\n", "at least one agent under test"),
         ("[agents.maya]\nnetwork_mode = 'no-network'\n", "Extra inputs"),
-        ("[agents.maya]\nuser = 'maya'\n", "Extra inputs"),
         ("[agent]\nuser = 'maya'\n[agents.maya]\n", "set user: on each seat"),
         ('[agents."bad name"]\n', "Invalid Docker Compose service name"),
         (
@@ -127,3 +126,13 @@ def test_seat_task_is_valid_without_instruction_md(tmp_path: Path):
 
     assert Task.is_valid_dir(task_dir)
     assert Task.is_valid_dir(task_dir, disable_verification=True)
+
+
+def test_seat_user_is_accepted():
+    # A seat may declare its OS user (used by environments with no per-service
+    # user, e.g. a Kubernetes pod shared via the main transport).
+    cfg = TaskConfig.model_validate_toml(
+        '[agent]\ntimeout_sec = 60\n[agents.maya]\nuser = "agent"\n[agents.raj]\n'
+    )
+    assert cfg.agents["maya"].user == "agent"
+    assert cfg.agents["raj"].user is None
